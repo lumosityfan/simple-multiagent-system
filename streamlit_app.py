@@ -1,7 +1,8 @@
 import streamlit as st
+import os
 import requests
 
-API_URL = "http://localhost:8000/chat"
+API_URL = os.getenv("FASTAPI_URL", "http://localhost:8000") + "/chat"
 
 st.title("Multi-agent Assistant")
 st.caption("Powered by math, weather, news, recipes, jokes, translation, dictionary, and currency agents")

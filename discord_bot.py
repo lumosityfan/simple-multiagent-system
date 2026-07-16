@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_URL = "http://localhost:8000/chat"
+API_URL = os.getenv("FASTAPI_URL", "http://localhost:8000") + "/chat"
 
 intents = discord.Intents.default()
 intents.message_content = True
