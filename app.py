@@ -7,7 +7,8 @@ import requests
 from datetime import datetime, timezone, timedelta
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
 
 load_dotenv(override=True)
 
@@ -602,6 +603,6 @@ async def chat(user_input: str, thread_id: str = "main-session") -> str:
     return "\n\n".join(results)
 
 if __name__ == "__main__":
-    with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+    with PostgresSaver.from_conn_string(os.getenv("DATABASE_URL")) as checkpointer:
         agent = agent_builder.compile(checkpointer=checkpointer)
         run()

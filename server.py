@@ -2,13 +2,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.postgres import PostgresSaver
+import psycopg
 import app as agent_app
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: open the SQLite connection and compile the graph
-    with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+    with PostgresSaver.from_conn_string(os.getenv("DATABASE_URL")) as checkpointer:
         agent_app.agent = agent_app.agent_builder.compile(checkpointer=checkpointer)
         yield
     # Shutdown: the 'with' block exits here, closing the connection clearly

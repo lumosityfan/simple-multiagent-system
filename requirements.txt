@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+streamlit
+discord.py
+aiohttp
+langgraph
+langgraph-checkpoint-postgres
+psycopg[binary]
+openai
+python-dotenv
+requests
