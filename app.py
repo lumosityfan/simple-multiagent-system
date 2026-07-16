@@ -604,5 +604,6 @@ async def chat(user_input: str, thread_id: str = "main-session") -> str:
 
 if __name__ == "__main__":
     with PostgresSaver.from_conn_string(os.getenv("DATABASE_URL")) as checkpointer:
+        checkpointer.setup()
         agent = agent_builder.compile(checkpointer=checkpointer)
         run()

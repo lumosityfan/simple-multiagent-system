@@ -11,6 +11,7 @@ import app as agent_app
 async def lifespan(app: FastAPI):
     # Startup: open the SQLite connection and compile the graph
     with PostgresSaver.from_conn_string(os.getenv("DATABASE_URL")) as checkpointer:
+        checkpointer.setup()
         agent_app.agent = agent_app.agent_builder.compile(checkpointer=checkpointer)
         yield
     # Shutdown: the 'with' block exits here, closing the connection clearly
