@@ -4,6 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langgraph.checkpoint.postgres import PostgresSaver
 import psycopg
+import os
 import app as agent_app
 
 @asynccontextmanager
