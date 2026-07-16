@@ -1,22 +1,14 @@
-[
-    build
-]
+[build]
 builder = "nixpacks"
 
-[[
-    services
-]]
-nae = "fastapi"
+[[services]]
+name = "fastapi"
 startCommand = "uvicorn server:app --host 0.0.0.0 --port $PORT"
 
-[[
-    services
-]]
+[[services]]
 name = "streamlit"
-startCommand = "streamlit run streamlit_app.py --server.port $PORT -- server.address 0.0.0.0"
+startCommand = "streamlit run streamlit_app.py --server.port $PORT --server.address 0.0.0.0"
 
-[[
-    services
-]]
+[[services]]
 name = "discord-bot"
 startCommand = "python discord_bot.py"
