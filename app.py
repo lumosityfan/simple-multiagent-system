@@ -4,13 +4,23 @@ import uuid
 import json
 import os
 import requests
+from typing import Annotated
+from langgraph.types import Send
 from datetime import datetime, timezone, timedelta
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.postgres import PostgresSaver
-import psycopg
+import operator
 
 load_dotenv(override=True)
+
+def merge_dicts(a: dict, b: dict) -> dict:
+    return {**a, **b}
+
+def replace_or_add(existing: list, new: list) -> list:
+    """If new is empty, reset. Otherwise append."""
+    if not new:
+        return []
+    return existing + new
 
 agent = None # set by server.py lifespan or run() below
 THREAD_ID = "main-session"
@@ -23,31 +33,72 @@ class AgentState(TypedDict):
     last_result: str
     next_agent: str
     results: list[str]
+    parallel_results: Annotated[list[dict], replace_or_add]
     joke_history: list[str]
-    weather_cache: dict
-    currency_cache: dict
-    news_cache: dict
+    weather_cache: Annotated[dict, merge_dicts]
+    currency_cache: Annotated[dict, merge_dicts]
+    news_cache: Annotated[dict, merge_dicts]
     conversation_history: list[dict]
 
 def split_node(state: AgentState) -> dict:
-    sub_prompts = split_prompt(state["user_prompt"])
+    resolved = resolve_context(state["user_prompt"], state.get("conversation_history", []))
+    sub_prompts = split_prompt(resolved)
     return {"sub_prompts": sub_prompts}
 
-def route_node(state: AgentState) -> dict:
-    decision = route_prompt(state["current_prompt"])
-    return {"next_agent": decision.get("agent", "none")}
+def parallel_dispatch(state: AgentState):
+    """
+    Replaces route_node for multi-sub-prompt requests.
+    Fires a Send for each sub-prompt simultaneously.
+    """
+    sends = []
+    for sub_prompt in state["sub_prompts"]:
+        # route each sub-prompt to find its agent
+        decision = route_prompt(sub_prompt)
+        agent_name = decision.get("agent", "fallback")
+        node = agent_name if agent_name in NODES else "fallback"
+        sends.append(Send(node, {
+            **state,
+            "current_prompt": sub_prompt,
+            "last_agent": state.get("last_agent", ""),
+            "last_result": state.get("last_result", ""),
+            "parallel_results": [], 
+            "results": [],
+        }))
+    return sends
+
+def merge_node(state: AgentState) -> dict:
+    """
+    Collects all parallel results after agents finish.
+    Combines them into last_result and results for history_node.
+    """
+    combined_results = state.get("parallel_results", [])
+    # sort by original sub_prompt order to keep output consistent
+    combined_results.sort(key=lambda x: state["sub_prompts"].index(x["sub_prompt"])
+                          if x["sub_prompt"] in state["sub_prompts"] else 0)
+    
+    last = combined_results[-1] if combined_results else {}
+    return {
+        "last_agent": last.get("agent", ""),
+        "last_result": last.get("result", ""),
+        "results": [f"{r['agent']} - {r['result']}" for r in combined_results],
+    }
 
 def math_node(state: AgentState) -> dict:
     prompt = state["current_prompt"]
     if state.get("last_agent") == "weather" and state.get("last_result"):
         prompt += f"\n\nFor context, use this weather data: {state['last_result']}"
     result = math_agent(prompt)
-    return {"last_agent": "math", "last_result": result, "results": [result]}
+    return {
+        "parallel_results": [{"agent": "math", "result": result, "sub_prompt": state["current_prompt"]}],
+        }
 
 def weather_node(state: AgentState) -> dict:
     weather_cache = state.get("weather_cache", {})
     result = weather_agent(state["current_prompt"], weather_cache)
-    return {"last_agent": "weather", "last_result": result, "results": [result], "weather_cache": weather_cache}
+    return {
+        "weather_cache": weather_cache,
+        "parallel_results": [{"agent": "weather", "result": result, "sub_prompt": state["current_prompt"]}],
+        }
 
 def joke_node(state: AgentState) -> dict:
     joke_history = state.get("joke_history", [])
@@ -63,33 +114,38 @@ def joke_node(state: AgentState) -> dict:
     if state.get("last_agent") == "news" and state.get("last_result"):
         prompt += f"\n\nFor context, the requested news is: {state['last_result']}"
     result = joke_agent(prompt, history_note)
-    return {"last_agent": "joke", "last_result": result, "results": [result], "joke_history": joke_history + [result]}
+    return {
+            "parallel_results": [{"agent": "joke", "result": result, "sub_prompt": state["current_prompt"]}],
+            "joke_history": joke_history + [result]}
 
 def translation_node(state: AgentState) -> dict:
     result = translation_agent(state["current_prompt"])
-    return {"last_agent": "translation", "last_result": result, "results": [result]}
+    return {
+            "parallel_results": [{"agent": "translation", "result": result, "sub_prompt": state["current_prompt"]}]}
 
 def dictionary_node(state: AgentState) -> dict:
     result = dictionary_agent(state["current_prompt"])
-    return {"last_agent": "dictionary", "last_result": result, "results": [result]}
+    return { 
+            "parallel_results": [{"agent": "dictionary", "result": result, "sub_prompt": state["current_prompt"]}]}
 
 def recipe_node(state: AgentState) -> dict:
     result = recipe_agent(state["current_prompt"])
-    return {"last_agent": "recipe", "last_result": result, "results": [result]}
+    return {
+            "parallel_results": [{"agent": "recipe", "result": result, "sub_prompt": state["current_prompt"]}]}
 
 def news_node(state: AgentState) -> dict:
     news_cache = state.get("news_cache", {})
     result = news_agent(state["current_prompt"], news_cache)
-    return {"last_agent": "news", "last_result": result, "results": [result], "news_cache": news_cache}
+    return { "parallel_results": [{"agent": "news", "result": result, "sub_prompt": state["current_prompt"]}], "news_cache": news_cache}
 
 def currency_node(state: AgentState) -> dict:
     currency_cache = state.get("currency_cache", {})
     result = currency_agent(state["current_prompt"], currency_cache)
-    return {"last_agent": "currency", "last_result": result, "results": [result], "currency_cache": currency_cache}
+    return {"parallel_results": [{"agent": "currency", "result": result, "sub_prompt": state["current_prompt"]}], "currency_cache": currency_cache}
 
 def fallback_node(state: AgentState) -> dict:
     result = fallback_agent(state["current_prompt"])
-    return {"last_agent": "fallback", "last_result": result, "results": [result]}
+    return {"parallel_results": [{"agent": "fallback", "result": result, "sub_prompt": state["current_prompt"]}]}
 
 def history_node(state: AgentState) -> dict:
     history = list(state.get("conversation_history", []))
@@ -104,10 +160,6 @@ def history_node(state: AgentState) -> dict:
         "content": state["last_result"]
     })
     return {"conversation_history": history[-20:]}
-
-def route_decision(state: AgentState) -> str:
-    agent = state.get("next_agent", "none")
-    return agent
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -499,7 +551,7 @@ NODES = {
     "recipe": recipe_node,
     "news": news_node,
     "currency": currency_node,
-    "fallback": fallback_node
+    "fallback": fallback_node,
 }
 
 CACHE_TTL = timedelta(minutes=15)
@@ -529,32 +581,20 @@ def run():
 
 agent_builder = StateGraph(AgentState)
 
-agent_builder.add_node("route", route_node)
-for node in NODES:
-    agent_builder.add_node(node, NODES[node])
+agent_builder.add_node("split", split_node)
+agent_builder.add_node("merge", merge_node)
 
-agent_builder.add_edge(START, "route")
-agent_builder.add_conditional_edges(
-    "route",
-    route_decision,
-    {
-        "math": "math",
-        "weather": "weather",
-        "joke": "joke",
-        "translation": "translation",
-        "dictionary": "dictionary",
-        "recipe": "recipe",
-        "news": "news",
-        "currency": "currency",
-        "fallback": "fallback",
-    }
-)
+agent_builder.add_edge(START, "split")
+
+agent_builder.add_conditional_edges("split", parallel_dispatch)
 
 agent_builder.add_node("history", history_node)
 
 for node in NODES:
-    agent_builder.add_edge(node, "history")
+    agent_builder.add_node(node, NODES[node])
+    agent_builder.add_edge(node, "merge")
 
+agent_builder.add_edge("merge", "history")
 agent_builder.add_edge("history", END)
 
 async def chat(user_input: str, thread_id: str = "main-session") -> str:
@@ -565,45 +605,40 @@ async def chat(user_input: str, thread_id: str = "main-session") -> str:
     config = {"configurable": {"thread_id": thread_id}}
     existing = agent.get_state(config)
     first_invoke = not existing.values
-    conversation_history = existing.values.get("conversation_history", [])
 
-    resolved_input = resolve_context(user_input, conversation_history)
-    sub_prompts = split_prompt(resolved_input)
+    invoke_state = {
+        "user_prompt": user_input,
+        "current_prompt": user_input,
+        "sub_prompts": [],
+        "last_agent": "",
+        "last_result": "",
+        "next_agent": "",
+        "results": [],
+        "parallel_results": [],
+        "conversation_history": existing.values.get("conversation_history", []),
+    }
 
-    results = []
-    last_agent = ""
-    last_result = ""
+    if first_invoke:
+        invoke_state["joke_history"] = []
+        invoke_state["weather_cache"] = {}
+        invoke_state["currency_cache"] = {}
+        invoke_state["news_cache"] = {}
+        invoke_state["conversation_history"] = []
+        first_invoke = False
 
-    for sub_prompt in sub_prompts:
-        invoke_state = {
-            "user_prompt": user_input,
-            "current_prompt": sub_prompt,
-            "sub_prompts": sub_prompts,
-            "last_agent": last_agent,
-            "last_result": last_result,
-            "next_agent": "",
-            "results": [],
-            "conversation_history": conversation_history,
-        }
-        if first_invoke:
-            invoke_state["joke_history"] = []
-            invoke_state["weather_cache"] = {}
-            invoke_state["currency_cache"] = {}
-            invoke_state["news_cache"] = {}
-            invoke_state["conversation_history"] = []
-            first_invoke = False
-
-        final_state = agent.invoke(invoke_state, config=config)
-        for result in final_state["results"]:
-            results.append(f"{final_state['last_agent']} - {result}")
-
-        last_agent = final_state["last_agent"]
-        last_result = final_state["last_result"]
-
-    return "\n\n".join(results)
+    final_state = agent.invoke(invoke_state, config=config)
+    return "\n\n".join(final_state.get("results", []))
 
 if __name__ == "__main__":
-    with PostgresSaver.from_conn_string(os.getenv("DATABASE_URL")) as checkpointer:
+    db_url = os.getenv("DATABASE_URL", "")
+    if db_url:
+        from langgraph.checkpoint.postgres import PostgresSaver
+        checkpointer_cm = PostgresSaver.from_conn_string(db_url)
+    else:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        checkpointer_cm = SqliteSaver.from_conn_string("checkpoints.db")
+
+    with checkpointer_cm as checkpointer:
         checkpointer.setup()
         agent = agent_builder.compile(checkpointer=checkpointer)
         run()

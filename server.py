@@ -9,8 +9,16 @@ import app as agent_app
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: open the SQLite connection and compile the graph
-    with PostgresSaver.from_conn_string(os.getenv("DATABASE_URL")) as checkpointer:
+    db_url = os.getenv("DATABASE_URL", "")
+    if db_url:
+        from langgraph.checkpoint.postgres import PostgresSaver
+        checkpointer_cm = PostgresSaver.from_conn_string(db_url)
+    else:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        checkpointer_cm = SqliteSaver.from_conn_string("checkpoints.db")
+    
+    # Startup: open the SQLite/Postgres connection and compile the graph
+    with checkpointer_cm as checkpointer:
         checkpointer.setup()
         agent_app.agent = agent_app.agent_builder.compile(checkpointer=checkpointer)
         yield
