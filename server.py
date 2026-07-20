@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import asyncio
+from asyncio import Lock
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +12,8 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 import psycopg
 import os
 import app as agent_app
+
+thread_locks: dict[str, Lock] = defaultdict(Lock)
 
 # Rate limit config
 RATE_LIMIT_REQUESTS = 10
@@ -77,8 +80,10 @@ async def chat_endpoint(request: ChatRequest, req: Request):
             status_code=429,
             content={"error": "Rate limit exceeded. Please wait before sending another request."}
         )
-    response = await agent_app.chat(request.message, request.thread_id)
-    return ChatResponse(response=response)
+    
+    async with thread_locks[rate_limit_key]:
+        response = await agent_app.chat(request.message, request.thread_id)
+        return ChatResponse(response=response)
 
 @app.get("/health")
 async def health():
