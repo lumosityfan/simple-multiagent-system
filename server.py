@@ -70,9 +70,9 @@ class ChatResponse(BaseModel):
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, req: Request):
-    client_ip = req.client.host
+    rate_limit_key = request.thread_id if request.thread_id else req.client.host
 
-    if not await check_rate_limit(client_ip):
+    if not await check_rate_limit(rate_limit_key):
         return JSONResponse(
             status_code=429,
             content={"error": "Rate limit exceeded. Please wait before sending another request."}
