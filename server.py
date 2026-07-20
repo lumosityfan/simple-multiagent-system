@@ -7,8 +7,6 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.checkpoint.sqlite import SqliteSaver
 import psycopg
 import os
 import app as agent_app
@@ -44,8 +42,10 @@ async def check_rate_limit(client_ip: str) -> bool:
 async def lifespan(app: FastAPI):
     db_url = os.getenv("DATABASE_URL", "")
     if db_url:
+        from langgraph.checkpoint.postgres import PostgresSaver
         checkpointer_cm = PostgresSaver.from_conn_string(db_url)
     else:
+        from langgraph.checkpoint.sqlite import SqliteSaver
         checkpointer_cm = SqliteSaver.from_conn_string("checkpoints.db")
     
     # Startup: open the SQLite/Postgres connection and compile the graph
