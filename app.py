@@ -39,6 +39,8 @@ class AgentState(TypedDict):
     currency_cache: Annotated[dict, merge_dicts]
     news_cache: Annotated[dict, merge_dicts]
     conversation_history: list[dict]
+    needs_retry: list[dict]
+    retry_count: int
 
 def split_node(state: AgentState) -> dict:
     resolved = resolve_context(state["user_prompt"], state.get("conversation_history", []))
@@ -65,6 +67,24 @@ def parallel_dispatch(state: AgentState):
             "results": [],
         }))
     return sends
+
+def retry_dispatch(state: AgentState) -> list:
+    sends = []
+    for item in state.get("needs_retry", []):
+        node = item["agent"] if item["agent"] in NODES else "fallback"
+        sends.append(Send(node, {
+            **state,
+            "current_prompt": f"{item['sub_prompt']}\n\nNote: {item['retry_instruction']}",
+            "parallel_results": [],
+            "results": [],
+            "needs_retry": [],
+        }))
+    return sends
+
+def supervisor_decision(state: AgentState) -> str:
+    if state.get("needs_retry"):
+        return retry_dispatch(state)
+    return "history"
 
 def merge_node(state: AgentState) -> dict:
     """
@@ -530,6 +550,65 @@ Examples:
 "Convert 100 USD to EUR" → {"agent": "currency"}
 No other text."""
 
+SUPERVISOR_PROMPT = """You are a quality control supervisor reviewing agent responses.
+Given the agent type, the user's request, and the agent's response, determine if the response is clearly wrong or empty.
+
+Be VERY lenient — only reject if:
+- The response is empty or just whitespace
+- The response is completely off-topic (e.g. a joke agent returned a weather report)
+- The response explicitly says it cannot help when it should be able to
+- The response is truncated mid-sentence with no useful content
+
+DO NOT reject for:
+- Style or tone issues
+- Responses that could be better but are still valid
+- Subjective quality judgments
+
+Respond ONLY with a JSON object:
+{"verdict": "approve"}
+or
+{"verdict": "retry", "instruction": "<one specific instruction to fix the exact problem>"}"""
+
+def supervisor_node(state: AgentState) -> dict:
+    # never retry more than once
+    if state.get("retry_count", 0) >= 1:
+        return {"retry_count": 0, "needs_retry": []}
+
+    results = state.get("parallel_results", [])
+    approved = []
+    needs_retry = []
+
+    for r in results:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SUPERVISOR_PROMPT},
+                {"role": "user", "content": (
+                    f"Agent type: {r['agent']}\n"
+                    f"User request: {r['sub_prompt']}\n"
+                    f"Agent response: {r['result']}"
+                )}
+            ]
+        )
+        try:
+            verdict = json.loads(response.choices[0].message.content.strip())
+        except json.JSONDecodeError:
+            verdict = {"verdict": "approve"}
+
+        if verdict.get("verdict") == "approve":
+            approved.append(r)
+        else:
+            needs_retry.append({
+                **r,
+                "retry_instruction": verdict.get("instruction", "Please try again.")
+            })
+
+    return {
+        "parallel_results": approved,
+        "needs_retry": needs_retry,
+        "retry_count": state.get("retry_count", 0) + 1 if needs_retry else 0,
+    }
+
 AGENTS = {
     "math": math_agent,
     "weather": weather_agent,
@@ -588,13 +667,22 @@ agent_builder.add_edge(START, "split")
 
 agent_builder.add_conditional_edges("split", parallel_dispatch)
 
+agent_builder.add_node("supervisor", supervisor_node)
 agent_builder.add_node("history", history_node)
 
 for node in NODES:
     agent_builder.add_node(node, NODES[node])
     agent_builder.add_edge(node, "merge")
 
-agent_builder.add_edge("merge", "history")
+agent_builder.add_edge("merge", "supervisor")
+agent_builder.add_conditional_edges(
+    "supervisor",
+    supervisor_decision,
+    {
+        "history": "history",
+    }
+)
+agent_builder.add_edge("merge", "supervisor")
 agent_builder.add_edge("history", END)
 
 async def chat(user_input: str, thread_id: str = "main-session") -> str:
@@ -616,6 +704,8 @@ async def chat(user_input: str, thread_id: str = "main-session") -> str:
         "results": [],
         "parallel_results": [],
         "conversation_history": existing.values.get("conversation_history", []),
+        "needs_try": [],
+        "retry_count": 0,
     }
 
     if first_invoke:
